@@ -4,6 +4,7 @@ import threading
 import json
 import psycopg2
 from psycopg2 import OperationalError
+from psycopg2.extras import DictCursor
 import sys
 
 # Configure logging
@@ -37,7 +38,7 @@ port = "5431"       # default PostgreSQL port
 conn = create_connection(db_name, user, password, host, port)
 
 # conn = psycopg2.connect(dbname="", user="", password="", host="localhost", port="")
-cur = conn.cursor()
+cur = conn.cursor(cursor_factory=DictCursor)
 create_script = '''
 
         CREATE TABLE IF NOT EXISTS peers (
@@ -107,12 +108,12 @@ def client_handler(conn, addr):
             if command.get('action') == 'introduce':
                 client_peers_hostname = command.get('peers_hostname')
                 print("peerhost name:",peers_hostname)
-                active_connections[client_peers_hostname] = conn # store the connection
-                host_files_online.append(client_peers_hostname)
+                active_connections[peers_ip] = conn # store the connection
+                host_files_online.append((peers_ip, peers_port))
                 log_event(f"Connection established with {client_peers_hostname}/{peers_ip}:{peers_port})")
-                for hostname in host_files_online:
-                    print("ping when access",hostname)
-                    ping_host(hostname)
+                # for hostname in host_files_online:
+                #     print("ping when access",hostname)
+                #     ping_host(hostname)
 
             elif command['action'] == 'publish':
                 # peers_ip,peers_port,peers_hostname,file_name,piece_hash
@@ -122,16 +123,25 @@ def client_handler(conn, addr):
                 conn.sendall("File list updated successfully.".encode())
 
             elif command['action'] == 'download':
-                # print("fetch",file_name, num_order_in_file, piece_hash)
+                print("fetch",file_name, num_order_in_file, piece_hash)
+                print("connect db to take host")
                 # Query the database for the IP addresses of the clients that have the file
-                cur.execute("SELECT * FROM peers WHERE file_name = %s AND num_order_in_file <> ALL (%s) AND piece_hash <> ALL (%s)", (file_name, num_order_in_file, piece_hash))
+                cur.execute("SELECT * FROM peers WHERE file_name = %s AND num_order_in_file <> ALL  (%s) AND piece_hash <> ALL (%s)", (file_name, num_order_in_file, piece_hash))
                 results = cur.fetchall()
+                filtered_results = [
+                    row for row in results
+                    if (row['peers_ip'], row['peers_port']) in host_files_online #0 is peers_ip, 1 is peers_port
+                ]
+
+                print(results)
                 if results:
+                    print("file available")
                     # Create a list of dictionaries with 'hostname' and 'ip' keys
-                    peers_info = [{'peers_ip': peers_ip, 'peers_port': peers_port, 'peers_hostname': peers_hostname, 'file_name':file_name,'file_size':file_size,'piece_hash':piece_hash,'piece_size':piece_size,'num_order_in_file':num_order_in_file } for peers_ip, peers_port, peers_hostname, file_name,file_size, piece_hash,piece_size, num_order_in_file  in results if peers_hostname in active_connections]
-                    conn.sendall(json.dumps({'peers_info': peers_info}).encode())
+                    peers_info = [{'peers_ip': peers_ip, 'peers_port': peers_port, 'peers_hostname': peers_hostname, 'file_name':file_name,'file_size':file_size,'piece_hash':piece_hash,'piece_size':piece_size,'num_order_in_file':num_order_in_file } for peers_ip, peers_port, peers_hostname, file_name,file_size, piece_hash,piece_size, num_order_in_file  in filtered_results if peers_hostname in active_connections]
+                    conn.sendall(json.dumps({'action': 'download-reply','peers_info': peers_info}).encode())
                 else:
-                    conn.sendall(json.dumps({'error': 'File not available'}).encode())
+                    print("file not available")
+                    conn.sendall(json.dumps({'action': 'download-reply','error': 'File not available'}).encode())
 
             elif command['action'] == 'file_list':
                 files = command['files']
@@ -139,8 +149,8 @@ def client_handler(conn, addr):
             elif command['action'] == 'ping-reply':
                 log_event(f"Received ping-reply from {peers_hostname}/{peers_ip}:{peers_port}")
             elif command['action'] == 'exit':
-                handle_update_list_peer(peers_hostname)
-                host_files_online.remove(peers_hostname)
+                handle_update_list_peer(peers_ip)
+                host_files_online.remove((peers_ip, peers_port))
                 break
 
     except Exception as e:
@@ -150,8 +160,8 @@ def client_handler(conn, addr):
         #     del active_connections[peers_hostname] 
         if not conn._closed:
             conn.close()
-        if peers_hostname in host_files_online:
-            host_files_online.remove(peers_hostname)
+        if peers_ip in host_files_online:
+            host_files_online.remove(peers_ip)
         log_event(f"Connection with {addr} has been closed.")
         # for hostname in active_connections:
         #     print(hostname)

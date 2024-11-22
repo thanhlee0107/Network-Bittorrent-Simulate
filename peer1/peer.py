@@ -5,11 +5,15 @@ import threading
 import shlex
 import hashlib
 import math
+import time
+from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 
 stop_event = threading.Event()
+lock = threading.Lock()  # Để đồng bộ trạng thái giữa các thread
 
 list_of_peers_online = []
-
+condition = threading.Condition()
 def calculate_piece_hash(piece_data):
     sha1 = hashlib.sha1()
     sha1.update(piece_data)
@@ -93,18 +97,35 @@ def check_local_piece_files(file_name):
     if len(exist_files) > 0:
         return exist_files
     else:
-        return False
+        return []
 
 def handle_publish_piece(sock, peers_port, pieces, file_name,file_size,piece_size):
     pieces_hash = create_pieces_string(pieces)
-    user_input_num_piece = input( f"File {file_name} have {pieces}\n piece: {pieces_hash}. \nPlease select num piece in file to publish:" )
-    num_order_in_file = shlex.split(user_input_num_piece) 
-    piece_hash=[]
-    print("You was selected: " )
-    for i in num_order_in_file:
-        index = pieces.index(f"{file_name}_piece{i}")
-        piece_hash.append(pieces_hash[index])
-        print (f"Number {i} : {pieces_hash[index]}")
+    total_pieces = len(pieces)
+    while True:
+        print(f"File '{file_name}' has {total_pieces} pieces.")
+        user_input_num_piece = input( f"File {file_name} have {pieces}\n piece: {pieces_hash}. \nPlease select num piece in file to publish:" )
+        if user_input_num_piece.lower() == "all":
+            piece_hash = pieces_hash
+            num_order_in_file = list(range(1, total_pieces + 1))
+            print("You selected: All pieces")
+            for i, hash_value in enumerate(piece_hash, start=1):
+                print(f"Number {i}: {hash_value}")
+            break
+        try:
+            num_order_in_file = list(map(int, shlex.split(user_input_num_piece))) 
+            if any(num < 1 or num > total_pieces for num in num_order_in_file):
+                print(f"Invalid selection. Please select numbers between 1 and {total_pieces}.")
+                continue
+            piece_hash=[]
+            print("You selected: " )
+            for i in num_order_in_file:
+                index = pieces.index(f"{file_name}_piece{i}")
+                piece_hash.append(pieces_hash[index])
+                print (f"Number {i} : {pieces_hash[index]}")
+            break
+        except ValueError:
+            print("Invalid input format. Please enter numbers separated by spaces or 'all'.")
     publish_piece_file(sock,peers_port,file_name,file_size, piece_hash,piece_size,num_order_in_file)
 
 def publish_piece_file(sock,peers_port,file_name,file_size, piece_hash,piece_size,num_order_in_file):
@@ -120,6 +141,7 @@ def publish_piece_file(sock,peers_port,file_name,file_size, piece_hash,piece_siz
         "num_order_in_file":num_order_in_file,
     }
     # shared_piece_files_dir.append(command)
+    # print("Publishing piece file") 
     sock.sendall(json.dumps(command).encode() + b'\n')
     # response = sock.recv(4096).decode()
     # print(response)
@@ -139,7 +161,8 @@ def request_file_from_peer(peers_ip, peer_port, file_name, piece_hash, num_order
                 f.write(data)
 
         peer_sock.close()
-        print(f"Piece of file: {file_name}_piece{num_order_in_file} has been fetched from peer.")
+        with lock:
+            print(f"Piece of file: {file_name}_piece{num_order_in_file} has been fetched from peer {peers_ip} with {peer_port}.")
     except Exception as e:
         print(f"An error occurred while connecting to peer at {peers_ip}:{peer_port} - {e}")
     finally:
@@ -160,27 +183,16 @@ def fetch_file(sock,peers_port,file_name, piece_hash, num_order_in_file):
         return
     # command = {"action": "fetch", "fname": fname}
     sock.sendall(json.dumps(command).encode() + b'\n')
-    response = json.loads(sock.recv(4096).decode())
-    if 'peers_info' in response:
-        peers_info = response['peers_info']
-        host_info_str = "\n".join([f"Number: {peer_info['num_order_in_file'] } {peer_info['peers_hostname']}/{peer_info['peers_ip']}:{peer_info['peers_port']} piece_hash: {peer_info['piece_hash']  } file_size: {peer_info['file_size']  } piece_size: {peer_info['piece_size']  } num_order_in_file: {peer_info['num_order_in_file'] }" for peer_info in peers_info])
-        print(f"Hosts with the file {file_name}:\n{host_info_str}")
-        if len(peers_info) >= 1:
-            chosen_info = input("Enter the number of the host to download from: ")
-            chosen_info_part = shlex.split(chosen_info) 
-            # Find the host entry with the chosen IP to get the corresponding lname
-            for i in chosen_info_part:
-                index = next((j for j, peer_info in enumerate(peers_info) if peer_info.get('num_order_in_file') == i), None)
-                if index is not None:
-                    request_file_from_peer(peers_info[index]['peers_ip'], peers_info[index]['peers_port'], peers_info[index]['file_name'],peers_info[index]['piece_hash'],peers_info[index]['num_order_in_file'])
-                else:
-                    print(f"Invalid number entered: {i}")
-            if(math.ceil(int(peers_info[0]['file_size'])/int(peers_info[0]['piece_size']))==len(sorted(pieces := check_local_piece_files(file_name)))):
-                merge_pieces_into_file(pieces,file_name)
-        else:
-            print("No hosts have the file.")
-    else:
-        print("No peers have the file or the response format is incorrect.")
+    timeout = 10  # Thời gian chờ tối đa
+    start_time = time.time()
+
+    with condition:
+        while not condition.wait(timeout):  # Chờ trong 10 giây
+            if time.time() - start_time > timeout:
+                print("Timeout while waiting for file download to complete.")
+                return
+
+    
 
 def send_piece_to_client(conn, piece):
     with open(piece, 'rb') as f:
@@ -227,6 +239,22 @@ def start_host_service(port, shared_files_dir):
             break
 
     server_sock.close()
+    
+def download_piece(peer_info, num_order_in_file):
+    try:
+        print(f"Thread {threading.current_thread().name} downloading piece {num_order_in_file} from Peer {peer_info['peers_hostname']} ({peer_info['peers_ip']}:{peer_info['peers_port']})...")
+        request_file_from_peer(
+            peer_info['peers_ip'],
+            peer_info['peers_port'],
+            peer_info['file_name'],
+            peer_info['piece_hash'],
+            num_order_in_file
+        )
+        print(f"Thread {threading.current_thread().name} successfully downloaded piece {num_order_in_file}.")
+        return num_order_in_file  # Trả về `piece` đã tải thành công
+    except Exception as e:
+        print(f"Thread {threading.current_thread().name} failed to download piece {num_order_in_file}: {e}")
+        return None  # Đánh dấu thất bại
 def handle_req_tracker(sock,peers_hostname,peers_port):
         while  not stop_event.is_set():
             try:
@@ -242,6 +270,7 @@ def handle_req_tracker(sock,peers_hostname,peers_port):
                     try:
                         # Chuyển chuỗi JSON thành dictionary
                         response = json.loads(response_data)
+                        
                         if response.get('action') == 'ping':
                             sock.sendall(json.dumps({'action': 'ping-reply', 'peers_hostname': peers_hostname, 'peers_port':peers_port }).encode() + b'\n')
                             print("receive ping from tracker")
@@ -252,13 +281,76 @@ def handle_req_tracker(sock,peers_hostname,peers_port):
                                         print("peer online:",peer)
                                     else:
                                         print("my hostname:",peer)
+                        elif response.get('action') == 'download-reply':
+                            # response = json.loads(sock.recv(4096).decode())
+                            if 'peers_info' in response:
+                                peers_info = response.get('peers_info', [])
+                                if not peers_info:
+                                    print("No hosts with the file available.")
+                                    
+                                else:
+                                    file_name = peers_info[0].get('file_name', None)
+                                    host_info_str = "\n".join([f"Number: {peer_info['num_order_in_file'] } {peer_info['peers_hostname']}/{peer_info['peers_ip']}:{peer_info['peers_port']} piece_hash: {peer_info['piece_hash']  } file_size: {peer_info['file_size']  } piece_size: {peer_info['piece_size']  } num_order_in_file: {peer_info['num_order_in_file'] }" for peer_info in peers_info])
+                                    print(f"Hosts with the file {file_name}:\n{host_info_str}")
+                                    
+                                    if len(peers_info) >= 1:
+                                        # chosen_info = input("Enter the number of piece of the host to download from: ")# choose the host, multiple hosts => fix auto choose
+                                        # chosen_info_part = shlex.split(chosen_info) #list piece choose
+                                        # # Find the host entry with the chosen IP to get the corresponding lname
+                                        # for i in chosen_info_part:
+                                        #     index = next((j for j, peer_info in enumerate(peers_info) if peer_info.get('num_order_in_file') == i), None)
+                                        #     if index is not None:
+                                        #         request_file_from_peer(peers_info[index]['peers_ip'], peers_info[index]['peers_port'], peers_info[index]['file_name'],peers_info[index]['piece_hash'],peers_info[index]['num_order_in_file'])
+                                        #     else:
+                                        #         print(f"Invalid number entered: {i}")
+                                        # Tính toán độ hiếm của mỗi piece
+                                        piece_counts = defaultdict(list)  # Lưu {num_order_in_file: [peer_info_1, peer_info_2, ...]}
+                                        for peer_info in peers_info:
+                                            piece_counts[peer_info['num_order_in_file']].append(peer_info)
+
+                                        # Sắp xếp các piece theo độ hiếm (ít peer nhất trước)
+                                        sorted_pieces = sorted(piece_counts.items(), key=lambda x: len(x[1]))
+                                        with ThreadPoolExecutor(max_workers=5) as executor:
+                                            for num_order_in_file, peers in sorted_pieces:
+                                                # Ưu tiên tải từ peer đầu tiên trong danh sách
+                                                peer_info = peers[0]
+                                                try:
+                                                    print(f"Downloading rare piece {num_order_in_file} from Peer {peer_info['peers_hostname']} ({peer_info['peers_ip']}:{peer_info['peers_port']})...")
+                                                    # request_file_from_peer(
+                                                    #     peer_info['peers_ip'],
+                                                    #     peer_info['peers_port'],
+                                                    #     peer_info['file_name'],
+                                                    #     peer_info['piece_hash'],
+                                                    #     peer_info['num_order_in_file']
+                                                    # )
+                                                    executor.submit(download_piece, peer_info, num_order_in_file)
+                                                    print(f"Successfully downloaded piece {num_order_in_file}.")
+                                                except Exception as e:
+                                                    print(f"Failed to download piece {num_order_in_file} from Peer {peer_info['peers_ip']}:{peer_info['peers_port']}: {e}")
+                                                    
+                                        if(math.ceil(int(peers_info[0]['file_size'])/int(peers_info[0]['piece_size']))==len(sorted(pieces := check_local_piece_files(file_name)))):
+                                            merge_pieces_into_file(pieces,file_name)
+                                        print("Download completed.")
+                                        
+                                    else:
+                                        print("No hosts have the file.")
+                            else:
+                                print("No peers have the file or the response format is incorrect.")
+                                error = response.get('error')
+                                if error:
+                                    print("Message from tracker:", error)
+
                         elif response.get('action') == 'request_file_list':
                             handle_file_list_request(sock)
+                        with condition:
+                            condition.notify()
                     except json.JSONDecodeError:
                         print(f"Invalid JSON received: {response_data}")
+
             except socket.error as e:
                 print(f"Socket error in handle_req_tracker: {e}") #In case peer command is "exit"
                 break  # Thoát vòng lặp nếu xảy ra lỗi kết nối
+            
 
     # except Exception as e:
     #     print(f"Error in handle_req_tracker: {e}")
@@ -269,10 +361,6 @@ def connect_to_server(server_host, server_port, peers_port):
     peers_hostname = socket.gethostname()
     sock.sendall(json.dumps({'action': 'introduce', 'peers_hostname': peers_hostname, 'peers_port':peers_port }).encode() + b'\n')
 
-        # thread_list_file = threading.Thread(target=handle_file_list_request, args=(sock,peers_hostname,peers_port,))
-        # thread_list_file.start()
-        # thread_reply = threading.Thread(target=handle_ping_request, args=(sock,peers_hostname,peers_port,))
-        # thread_reply.start()
     return sock
 
 def main(server_host, server_port, peers_port):
